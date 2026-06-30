@@ -486,23 +486,36 @@ function connectViaHostedAgentSphere(){
     const popup = window.open(AGENTSPHERE_CONNECT_URL, 'agentsphere-connect', 'width=430,height=720');
     if (!popup) { reject(new Error('Popup blocked — allow popups for sphere.unicity.network, then try again.')); return; }
 
+    const TARGET_ORIGIN = 'https://sphere.unicity.network';
+    const connectRequest = {
+      type: 'sphere_connect_request',
+      dapp: { name: 'UniTrade', description: 'Swap & Bridge dApp on Unicity AgentSphere', url: location.origin },
+      permissions: ['identity', 'balance']
+    };
+
+    function sendRequest(){
+      try { popup.postMessage(connectRequest, TARGET_ORIGIN); } catch (e) { /* popup not ready yet */ }
+    }
+
     function extractIdentity(data){
-      // Accept a range of plausible payload shapes so we're not locked
-      // to one exact schema guess.
       const identity = data.identity || data.account || data;
       const handle = identity?.nametag || identity?.username || identity?.address || identity?.account;
       if (!handle) return null;
-      return {
-        identity,
-        balances: data.balances || data.assets || null
-      };
+      return { identity, balances: data.balances || data.assets || null };
     }
 
     function onMessage(event){
-      if (event.origin !== 'https://sphere.unicity.network') return;
+      if (event.origin !== TARGET_ORIGIN) return;
       const data = event.data || {};
-      const rejected = /reject|declin|cancel/i.test(data.type || '');
-      if (rejected) { cleanup(); reject(new Error('Sign-in was declined in Unicity AgentSphere.')); return; }
+      const type = data.type || '';
+
+      // The wallet shows "Ready for connections" and waits for us to ask —
+      // any signal from it (a ready/hello event, or just being loaded) is
+      // our cue to (re)send the connect request immediately.
+      if (/ready|hello|loaded/i.test(type)) { sendRequest(); return; }
+
+      if (/reject|declin|cancel/i.test(type)) { cleanup(); reject(new Error('Sign-in was declined in Unicity AgentSphere.')); return; }
+
       const parsed = extractIdentity(data);
       if (parsed) { cleanup(); resolve(parsed); }
     }
@@ -511,12 +524,17 @@ function connectViaHostedAgentSphere(){
     }
     function cleanup(){
       window.removeEventListener('message', onMessage);
-      clearInterval(poll);
+      clearInterval(closeCheckPoll);
+      clearInterval(resendPoll);
       if (!popup.closed) popup.close();
     }
     window.addEventListener('message', onMessage);
-    const poll = setInterval(onClosedCheck, 700);
-    // expose for manual-confirm fallback below
+    const closeCheckPoll = setInterval(onClosedCheck, 700);
+    // The popup may take a moment to load and start listening, and might
+    // not proactively announce "ready" — so keep (re)sending the request
+    // every 1.5s until we get any reply, rather than relying on one shot.
+    const resendPoll = setInterval(sendRequest, 1500);
+    sendRequest();
     connectViaHostedAgentSphere._cleanup = cleanup;
   });
 }
@@ -563,15 +581,13 @@ async function connectWallet(){
   const btn = document.getElementById('connectBtn');
   if (btn.classList.contains('connected')) return; // already connected — nothing to do
 
-  btn.textContent = 'Opened AgentSphere — sign in there';
-  document.getElementById('manualConnectRow').style.display = 'flex';
-  pushBotMsg(`I opened Unicity AgentSphere in a new tab. AgentSphere doesn't message this page back automatically, so once you're signed in there, copy your @handle (and balances, if you want them accurate) into the box below and hit "Confirm" — that links this session to your real wallet without me ever touching your keys.`);
+  btn.textContent = 'Requesting connection…';
+  pushBotMsg(`Opened Unicity AgentSphere and sent a connect request — approve it there. If nothing prompts within a few seconds, use the manual box that appears next to the button to link your @handle and balances yourself.`);
 
   try{
-    // 20s: only used to auto-fill the handle if AgentSphere happens to
-    // post a message back. Most of the time nothing arrives — that's
-    // expected, not an error — so we don't show a failure for it.
-    const result = await withTimeout(connectViaHostedAgentSphere(), 20000, 'no auto handoff');
+    // 25s ceiling for the active handshake (we resend the request every
+    // 1.5s the whole time, in case AgentSphere needed a moment to load).
+    const result = await withTimeout(connectViaHostedAgentSphere(), 25000, 'no response to connect request');
     state.client = null;
     state.identity = result.identity;
     state.address = result.identity?.nametag ? '@' + result.identity.nametag
@@ -581,10 +597,12 @@ async function connectWallet(){
     await fetchRealBalances(result.balances);
     setConnectedUI(state.address);
     document.getElementById('manualConnectRow').style.display = 'none';
-    pushBotMsg(`Linked automatically as ${state.address}.`);
+    pushBotMsg(`Connected as ${state.address} via Unicity AgentSphere.`);
   } catch(e){
-    // Silent — no auto handoff is the expected case, not a failure to
-    // surface. The manual row stays visible and the button reverts.
+    // No response within the window — not necessarily an error on
+    // AgentSphere's side, just no message protocol to catch. Fall back
+    // to manual confirmation instead of hanging.
+    document.getElementById('manualConnectRow').style.display = 'flex';
     btn.textContent = 'Connect Unicity AgentSphere Wallet';
   }
 }
