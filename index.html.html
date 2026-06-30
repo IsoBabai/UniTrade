@@ -71,6 +71,19 @@
     text-decoration:underline; text-underline-offset:3px;
   }
   .demo-link:hover{ color:var(--gold-soft); }
+  .connect-wrap-outer{ display:flex; flex-direction:column; align-items:flex-end; gap:8px; }
+  .manual-connect-row{
+    display:none; gap:8px; align-items:center;
+    background:var(--panel-2); border:1px solid var(--line); border-radius:10px; padding:8px;
+  }
+  .manual-connect-row input{
+    background:transparent; border:none; outline:none; color:var(--paper);
+    font-family:var(--mono); font-size:12px; width:220px;
+  }
+  .manual-connect-row button{
+    font-family:var(--mono); font-size:12px; background:var(--gold); color:#fff;
+    border:none; border-radius:7px; padding:7px 12px; cursor:pointer; font-weight:700;
+  }
 
   /* ---------- layout ---------- */
   .grid{
@@ -260,9 +273,15 @@
       <div class="name">UniTrade</div>
       <div class="net-pill">● testnet</div>
     </div>
-    <div class="connect-wrap">
-      <button id="connectBtn">Connect Unicity AgentSphere Wallet</button>
-      <a href="#" id="demoModeLink" class="demo-link">Try demo mode</a>
+    <div class="connect-wrap-outer">
+      <div class="connect-wrap">
+        <button id="connectBtn">Connect Unicity AgentSphere Wallet</button>
+        <a href="#" id="demoModeLink" class="demo-link">Try demo mode</a>
+      </div>
+      <div class="manual-connect-row" id="manualConnectRow">
+        <input type="text" id="manualHandleInput" placeholder="@yourhandle (approved in AgentSphere)" />
+        <button id="manualConnectBtn">Confirm</button>
+      </div>
     </div>
   </header>
 
@@ -439,34 +458,17 @@ const RATES = { // demo static rates, token -> token
 /* =========================================================
    WALLET CONNECTION — Unicity AgentSphere only, real sign-in
    ---------------------------------------------------------
-   This requires explicit user approval inside the AgentSphere
-   extension itself — this page never assumes approval and never
-   fabricates a session. We use the documented, synchronous
-   window.sphere.connect() API the extension injects, with a bounded
-   wait for the extension to finish injecting on page load, and a
-   hard timeout so the button can never get stuck on "waiting".
-   If the extension isn't installed, we say so immediately and link
-   to the real install/sign-in page — we do NOT silently wait on an
-   unverified postMessage protocol with the hosted site.
+   AgentSphere is a hosted web wallet (not a browser extension) at
+   sphere.unicity.network. Connecting opens it in a popup with
+   ?origin=<this site>; the user approves there, and the wallet is
+   expected to post a message back to this window once approved.
+   We never fabricate a session — if no approval message arrives,
+   the button resets and a manual fallback lets you confirm the
+   handle you approved with, instead of getting stuck forever.
    ========================================================= */
 const AGENTSPHERE_CONNECT_URL =
   'https://sphere.unicity.network/connect?origin=' + encodeURIComponent(location.origin);
 
-/* Extensions sometimes inject window.sphere a beat after page load.
-   Poll briefly (up to ~2.5s) instead of assuming it's missing immediately. */
-function waitForExtension(maxWaitMs = 2500, intervalMs = 150){
-  return new Promise(resolve => {
-    if (window.sphere && window.sphere.connect) { resolve(true); return; }
-    const start = Date.now();
-    const poll = setInterval(() => {
-      if (window.sphere && window.sphere.connect) { clearInterval(poll); resolve(true); }
-      else if (Date.now() - start > maxWaitMs) { clearInterval(poll); resolve(false); }
-    }, intervalMs);
-  });
-}
-
-/* Wraps a promise with a hard timeout so a connect attempt can never
-   leave the UI stuck on "waiting" indefinitely. */
 function withTimeout(promise, ms, message){
   return Promise.race([
     promise,
@@ -474,26 +476,62 @@ function withTimeout(promise, ms, message){
   ]);
 }
 
-async function connectViaExtension(){
-  // Real, documented call: window.sphere.connect — no silent flag, so the
-  // extension shows its own approve/sign-in UI and the promise only
-  // resolves once the user acts on it there.
-  const res = await window.sphere.connect({
-    dapp: { name: 'UniTrade', description: 'Swap & Bridge dApp on Unicity AgentSphere', url: location.origin }
+function connectViaHostedAgentSphere(){
+  return new Promise((resolve, reject) => {
+    const popup = window.open(AGENTSPHERE_CONNECT_URL, 'agentsphere-connect', 'width=430,height=720');
+    if (!popup) { reject(new Error('Popup blocked — allow popups for sphere.unicity.network, then try again.')); return; }
+
+    function extractIdentity(data){
+      // Accept a range of plausible payload shapes so we're not locked
+      // to one exact schema guess.
+      const identity = data.identity || data.account || data;
+      const handle = identity?.nametag || identity?.username || identity?.address || identity?.account;
+      if (!handle) return null;
+      return {
+        identity,
+        balances: data.balances || data.assets || null
+      };
+    }
+
+    function onMessage(event){
+      if (event.origin !== 'https://sphere.unicity.network') return;
+      const data = event.data || {};
+      const rejected = /reject|declin|cancel/i.test(data.type || '');
+      if (rejected) { cleanup(); reject(new Error('Sign-in was declined in Unicity AgentSphere.')); return; }
+      const parsed = extractIdentity(data);
+      if (parsed) { cleanup(); resolve(parsed); }
+    }
+    function onClosedCheck(){
+      if (popup.closed) { cleanup(); reject(new Error('The AgentSphere window was closed before sign-in completed.')); }
+    }
+    function cleanup(){
+      window.removeEventListener('message', onMessage);
+      clearInterval(poll);
+      if (!popup.closed) popup.close();
+    }
+    window.addEventListener('message', onMessage);
+    const poll = setInterval(onClosedCheck, 700);
+    // expose for manual-confirm fallback below
+    connectViaHostedAgentSphere._cleanup = cleanup;
   });
-  return { client: window.sphere, identity: res.identity, permissions: res.permissions };
 }
 
-/* Pulls real balances from the live session. No values are invented —
-   any token that can't be queried is left at 0 with a console warning. */
-async function fetchRealBalances(){
+/* If AgentSphere already handed us balances in the approval message, use
+   those directly (most accurate). Otherwise try its query API if present.
+   We never invent a number — unresolved tokens stay at 0. */
+async function fetchRealBalances(handoffBalances){
   const tokens = ['UCT', 'USDC'];
-  if (window.sphere && window.sphere.getBalance) {
+  if (handoffBalances) {
     for (const t of tokens) {
-      try { state.balances[t] = parseFloat((await window.sphere.getBalance(t)) || 0) || 0; }
-      catch (e) { console.warn('Balance query failed for', t, e); state.balances[t] = 0; }
+      const found = Array.isArray(handoffBalances)
+        ? handoffBalances.find(a => (a.symbol || a.coinId || '').toUpperCase() === t)
+        : handoffBalances[t];
+      const amt = found?.amount ?? found?.balance ?? found;
+      state.balances[t] = parseFloat(amt) || 0;
     }
-  } else if (state.client && state.client.query) {
+    return;
+  }
+  if (state.client && state.client.query) {
     for (const t of tokens) {
       try {
         const res = await state.client.query('sphere_getBalance', { coinId: t });
@@ -501,7 +539,7 @@ async function fetchRealBalances(){
       } catch (e) { console.warn('Balance query failed for', t, e); state.balances[t] = 0; }
     }
   }
-  // If no query path exists, balances stay at 0 — we never guess.
+  // No source of truth found — leave at 0 rather than guess.
 }
 
 function setConnectedUI(label){
@@ -520,39 +558,46 @@ async function connectWallet(){
   const btn = document.getElementById('connectBtn');
   if (btn.classList.contains('connected')) return; // already connected — nothing to do
 
-  btn.textContent = 'Checking for AgentSphere…';
-  const hasExtension = await waitForExtension();
-
-  if (!hasExtension) {
-    btn.textContent = 'Connect Unicity AgentSphere Wallet';
-    pushBotMsg(
-      `I couldn't find the Unicity AgentSphere extension in this browser. Install it, then click connect again — or open the hosted sign-in at sphere.unicity.network/connect directly. No wallet was connected; "Try demo mode" below lets you explore the interface with placeholder data in the meantime.`,
-      true
-    );
-    return;
-  }
-
   btn.textContent = 'Waiting for sign-in…';
   try{
-    // Hard 60s ceiling — if the user never responds to the extension's
-    // approval popup, this fails loudly instead of hanging forever.
+    // 90s ceiling — if no approval message arrives, fail loudly instead
+    // of leaving the button stuck.
     const result = await withTimeout(
-      connectViaExtension(),
-      60000,
-      'No response from the AgentSphere approval popup within 60s — it may have been dismissed.'
+      connectViaHostedAgentSphere(),
+      90000,
+      'No approval received from AgentSphere within 90s.'
     );
-    state.client = result.client;
+    state.client = null;
     state.identity = result.identity;
-    state.address = result.identity?.nametag ? '@' + result.identity.nametag : result.identity?.address;
+    state.address = result.identity?.nametag ? '@' + result.identity.nametag
+                   : result.identity?.username ? '@' + result.identity.username
+                   : result.identity?.address || result.identity?.account;
     state.demo = false;
-    await fetchRealBalances();
+    await fetchRealBalances(result.balances);
     setConnectedUI(state.address);
     pushBotMsg(`Signed in as ${state.address} via Unicity AgentSphere.`);
   } catch(e){
     btn.textContent = 'Connect Unicity AgentSphere Wallet';
-    pushBotMsg('Could not sign in to Unicity AgentSphere: ' + (e.message || e) + '. No wallet was connected — use "Try demo mode" below if you just want to explore the interface.', true);
+    pushBotMsg(
+      'Could not complete sign-in automatically: ' + (e.message || e) +
+      `. If you approved inside the AgentSphere tab but it didn't link back, type your @nametag below and I'll mark the session connected — balances will need a manual refresh in that case. Otherwise, use "Try demo mode" to explore the interface.`,
+      true
+    );
+    document.getElementById('manualConnectRow').style.display = 'flex';
   }
+}
 
+function manualConfirmConnect(){
+  const input = document.getElementById('manualHandleInput');
+  const handle = input.value.trim().replace(/^@/, '');
+  if (!handle) return;
+  state.client = null;
+  state.identity = { nametag: handle };
+  state.address = '@' + handle;
+  state.demo = false;
+  setConnectedUI(state.address);
+  document.getElementById('manualConnectRow').style.display = 'none';
+  pushBotMsg(`Marked as signed in as @${handle}. I couldn't auto-fetch balances for this manual entry, so they show as 0 until a real session links back — use the AgentSphere tab to verify amounts before trading.`, true);
 }
 
 function loadDemoWallet(){
@@ -574,6 +619,7 @@ function fmt(n){ return Number(n).toLocaleString(undefined,{maximumFractionDigit
 
 document.getElementById('connectBtn').addEventListener('click', connectWallet);
 document.getElementById('demoModeLink').addEventListener('click', (e) => { e.preventDefault(); loadDemoWallet(); });
+document.getElementById('manualConnectBtn').addEventListener('click', manualConfirmConnect);
 
 /* =========================================================
    TABS
