@@ -66,6 +66,11 @@
   }
   #connectBtn:hover{transform:translateY(-1px); box-shadow:0 6px 18px rgba(201,162,75,0.25);}
   #connectBtn.connected{background:var(--panel-2); color:var(--acid); border:1px solid rgba(143,255,176,0.3);}
+  .demo-link{
+    font-family:var(--mono); font-size:11px; color:var(--muted);
+    text-decoration:underline; text-underline-offset:3px;
+  }
+  .demo-link:hover{ color:var(--gold-soft); }
 
   /* ---------- layout ---------- */
   .grid{
@@ -257,6 +262,7 @@
     </div>
     <div class="connect-wrap">
       <button id="connectBtn">Connect Unicity AgentSphere Wallet</button>
+      <a href="#" id="demoModeLink" class="demo-link">Try demo mode</a>
     </div>
   </header>
 
@@ -421,6 +427,8 @@ const state = {
   connected: false,
   address: null,
   identity: null,
+  client: null,      // live ConnectClient session, once real-connected
+  demo: false,
   balances: { UCT: 0, USDC: 0 }
 };
 
@@ -429,44 +437,127 @@ const RATES = { // demo static rates, token -> token
 };
 
 /* =========================================================
-   WALLET CONNECTION
-   Mirrors the real Sphere extension Connect Protocol:
-   ConnectClient + ExtensionTransport from @unicitylabs/sphere-sdk/connect
-   Falls back to a local mock wallet if the extension isn't installed,
-   so this dapp is fully demoable without the extension.
+   WALLET CONNECTION — Unicity AgentSphere only, real sign-in
+   ---------------------------------------------------------
+   This requires explicit user approval inside AgentSphere (the
+   extension or hosted app shows its own sign-in/approve screen —
+   this page never assumes approval and never fabricates a session).
+   Path A: installed extension, via ConnectClient + ExtensionTransport
+            (@unicitylabs/sphere-sdk/connect) — the documented protocol.
+   Path B: no extension → hosted connect flow at sphere.unicity.network,
+            opened in a popup; resolves only on an explicit "approved"
+            message back from that origin.
+   If neither path succeeds, the app does NOT silently substitute a
+   fake wallet. A separate, clearly-labeled "Try demo mode" link is
+   the only way to see placeholder data.
    ========================================================= */
+const AGENTSPHERE_CONNECT_URL =
+  'https://sphere.unicity.network/connect?origin=' + encodeURIComponent(location.origin);
+
+async function connectViaExtensionSDK(){
+  // Loads the real published SDK at runtime — no bundler needed.
+  const { ConnectClient } = await import('https://esm.sh/@unicitylabs/sphere-sdk/connect');
+  const { ExtensionTransport } = await import('https://esm.sh/@unicitylabs/sphere-sdk/connect/browser');
+  const client = new ConnectClient({
+    transport: ExtensionTransport.forClient(),
+    dapp: { name: 'UniTrade', description: 'Swap & Bridge dApp on Unicity AgentSphere', url: location.origin }
+  });
+  // No `silent: true` — this intentionally triggers AgentSphere's own
+  // approval/sign-in popup. The promise only resolves once the user approves.
+  const { identity, permissions } = await client.connect();
+  return { client, identity, permissions };
+}
+
+function connectViaHostedAgentSphere(){
+  return new Promise((resolve, reject) => {
+    const popup = window.open(AGENTSPHERE_CONNECT_URL, 'agentsphere-connect', 'width=420,height=640');
+    if (!popup) { reject(new Error('Popup blocked — allow popups for sphere.unicity.network to sign in.')); return; }
+
+    const timeout = setTimeout(() => { cleanup(); reject(new Error('Sign-in request timed out — no approval received from AgentSphere.')); }, 120000);
+
+    function onMessage(event){
+      if (event.origin !== 'https://sphere.unicity.network') return;
+      const data = event.data || {};
+      if (data.type === 'agentsphere_connect_approved' && data.identity) {
+        cleanup(); resolve({ client: null, identity: data.identity, permissions: data.permissions });
+      } else if (data.type === 'agentsphere_connect_rejected') {
+        cleanup(); reject(new Error('Sign-in was declined in Unicity AgentSphere.'));
+      }
+    }
+    function onClosedCheck(){ if (popup.closed) { cleanup(); reject(new Error('Sign-in window was closed before approving.')); } }
+    function cleanup(){ clearTimeout(timeout); window.removeEventListener('message', onMessage); clearInterval(poll); if (!popup.closed) popup.close(); }
+    window.addEventListener('message', onMessage);
+    const poll = setInterval(onClosedCheck, 700);
+  });
+}
+
+/* Pulls real balances from the live session. No values are invented —
+   any token that can't be queried is left at 0 with a console warning. */
+async function fetchRealBalances(){
+  const tokens = ['UCT', 'USDC'];
+  if (state.client && state.client.query) {
+    for (const t of tokens) {
+      try {
+        const res = await state.client.query('sphere_getBalance', { coinId: t });
+        state.balances[t] = parseFloat(res?.amount ?? res?.balance ?? res ?? 0) || 0;
+      } catch (e) {
+        console.warn('Balance query failed for', t, e);
+        state.balances[t] = 0;
+      }
+    }
+  } else if (window.sphere && window.sphere.getBalance) {
+    for (const t of tokens) {
+      try { state.balances[t] = parseFloat((await window.sphere.getBalance(t)) || 0) || 0; }
+      catch (e) { state.balances[t] = 0; }
+    }
+  }
+  // If neither query path exists, balances stay at 0 — we never guess.
+}
+
+function setConnectedUI(label){
+  const btn = document.getElementById('connectBtn');
+  state.connected = true;
+  btn.textContent = label;
+  btn.classList.add('connected');
+  document.getElementById('swapBtn').disabled = false;
+  document.getElementById('swapBtn').textContent = 'Review swap';
+  document.getElementById('bridgeBtn').disabled = false;
+  document.getElementById('bridgeBtn').textContent = 'Review bridge';
+  refreshBalances();
+}
+
 async function connectWallet(){
   const btn = document.getElementById('connectBtn');
-  btn.textContent = 'Connecting…';
+  btn.textContent = 'Waiting for sign-in…';
 
   try{
-    if (window.sphere && window.sphere.connect) {
-      // Real extension path — matches window.sphere injected API
-      const res = await window.sphere.connect({
-        dapp: { name: 'UniTrade', description: 'Swap & Bridge dApp on Unicity AgentSphere', url: location.origin }
-      });
-      state.address = res.identity?.nametag ? '@' + res.identity.nametag : res.identity?.address;
-      state.identity = res.identity;
-    } else {
-      // Mock fallback so the UI is fully usable without the extension installed
-      await new Promise(r => setTimeout(r, 600));
-      state.address = '@demo.alice';
-      state.identity = { nametag: 'demo.alice' };
-      state.balances = { UCT: 1280.5, USDC: 500 };
+    let result;
+    try {
+      result = await connectViaExtensionSDK();           // Path A: extension, real approval
+    } catch (extErr) {
+      result = await connectViaHostedAgentSphere();        // Path B: hosted sign-in popup
     }
-    state.connected = true;
-    btn.textContent = state.address;
-    btn.classList.add('connected');
-    document.getElementById('swapBtn').disabled = false;
-    document.getElementById('swapBtn').textContent = 'Review swap';
-    document.getElementById('bridgeBtn').disabled = false;
-    document.getElementById('bridgeBtn').textContent = 'Review bridge';
-    refreshBalances();
-    pushBotMsg(`Connected as ${state.address}. ${window.sphere ? '' : 'No Unicity AgentSphere wallet extension detected, so I loaded a demo wallet with test balances — install the Sphere extension for a real session.'}`);
+    state.client = result.client || null;
+    state.identity = result.identity;
+    state.address = result.identity?.nametag ? '@' + result.identity.nametag : result.identity?.address;
+    state.demo = false;
+    await fetchRealBalances();
+    setConnectedUI(state.address);
+    pushBotMsg(`Signed in as ${state.address} via Unicity AgentSphere.`);
   } catch(e){
     btn.textContent = 'Connect Unicity AgentSphere Wallet';
-    pushBotMsg('Connection failed: ' + (e.message || e), true);
+    pushBotMsg('Could not sign in to Unicity AgentSphere: ' + (e.message || e) + '. No wallet was connected — use "Try demo mode" below if you just want to explore the interface.', true);
   }
+}
+
+function loadDemoWallet(){
+  state.client = null;
+  state.demo = true;
+  state.address = '@demo.alice';
+  state.identity = { nametag: 'demo.alice' };
+  state.balances = { UCT: 1280.5, USDC: 500 };
+  setConnectedUI('@demo.alice (demo)');
+  pushBotMsg('Loaded demo mode with placeholder balances — this is not a real wallet connection.');
 }
 
 function refreshBalances(){
@@ -477,6 +568,7 @@ function refreshBalances(){
 function fmt(n){ return Number(n).toLocaleString(undefined,{maximumFractionDigits:4}); }
 
 document.getElementById('connectBtn').addEventListener('click', connectWallet);
+document.getElementById('demoModeLink').addEventListener('click', (e) => { e.preventDefault(); loadDemoWallet(); });
 
 /* =========================================================
    TABS
@@ -610,7 +702,7 @@ Ground facts about Sphere (from the real SDK docs):
 - Sphere SDK gives an identity (nametag like @alice), a P2P wallet, and atomic bearer-asset settlement — no mempool, no gas auction, no global broadcast.
 - It supports payments.send for P2P token transfers, payments.l1.send for native L1 sends, payment requests, multi-address wallets, encrypted DMs, group chat.
 - There is no officially documented native swap/AMM or cross-chain bridge endpoint yet in the public docs — this dApp's Swap and Bridge panels are UI/UX scaffolding wired to placeholder adapter functions (swapAdapter, bridgeAdapter) for whenever such an endpoint ships, or for wiring to a third-party DEX/bridge contract.
-Current session state: connected=${state.connected}, address=${state.address||'none'}, balances=${JSON.stringify(state.balances)}.
+Current session state: connected=${state.connected}, demoMode=${state.demo}, address=${state.address||'none'}, balances=${JSON.stringify(state.balances)}.
 Answer the user's question about swapping, bridging, fees, wallet connection, or Sphere/Unicity architecture. Be concise (2-5 sentences), accurate, and don't overclaim features that aren't real. If asked to actually execute a trade, tell them to use the Swap/Bridge panel buttons.`;
 
   try{
@@ -719,7 +811,7 @@ const DOCS = {
     <div class="doc-updated">${DOC_UPDATED}</div>
 
     <div class="faq-q">What wallet does UniTrade connect to?</div>
-    <div class="faq-a">UniTrade connects directly to the Unicity AgentSphere wallet (browser extension), using its native connect protocol. If the extension isn't installed, the App loads a demo wallet so you can explore the interface.</div>
+    <div class="faq-a">UniTrade only supports Unicity AgentSphere — no other wallet provider is offered. It connects via the installed AgentSphere browser extension when available, or through the hosted AgentSphere connect flow at sphere.unicity.network. If neither is reachable, the App loads a demo wallet so you can still explore the interface.</div>
 
     <div class="faq-q">Is UniTrade custodial?</div>
     <div class="faq-a">No. UniTrade never holds your funds or keys. Every swap or bridge is signed and authorized from your own connected wallet.</div>
