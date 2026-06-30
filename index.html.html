@@ -73,13 +73,16 @@
   .demo-link:hover{ color:var(--gold-soft); }
   .connect-wrap-outer{ display:flex; flex-direction:column; align-items:flex-end; gap:8px; }
   .manual-connect-row{
-    display:none; gap:8px; align-items:center;
+    display:none; gap:6px; align-items:center; flex-wrap:wrap; justify-content:flex-end;
     background:var(--panel-2); border:1px solid var(--line); border-radius:10px; padding:8px;
+    max-width:380px;
   }
   .manual-connect-row input{
-    background:transparent; border:none; outline:none; color:var(--paper);
-    font-family:var(--mono); font-size:12px; width:220px;
+    background:#fff; border:1px solid var(--line); outline:none; color:var(--paper);
+    font-family:var(--mono); font-size:12px; border-radius:6px; padding:6px 8px;
   }
+  .manual-connect-row input#manualHandleInput{ width:150px; }
+  .manual-connect-row input#manualUctInput, .manual-connect-row input#manualUsdcInput{ width:70px; }
   .manual-connect-row button{
     font-family:var(--mono); font-size:12px; background:var(--gold); color:#fff;
     border:none; border-radius:7px; padding:7px 12px; cursor:pointer; font-weight:700;
@@ -279,7 +282,9 @@
         <a href="#" id="demoModeLink" class="demo-link">Try demo mode</a>
       </div>
       <div class="manual-connect-row" id="manualConnectRow">
-        <input type="text" id="manualHandleInput" placeholder="@yourhandle (approved in AgentSphere)" />
+        <input type="text" id="manualHandleInput" placeholder="@handle from AgentSphere" />
+        <input type="number" id="manualUctInput" placeholder="UCT bal." />
+        <input type="number" id="manualUsdcInput" placeholder="USDC bal." />
         <button id="manualConnectBtn">Confirm</button>
       </div>
     </div>
@@ -558,15 +563,15 @@ async function connectWallet(){
   const btn = document.getElementById('connectBtn');
   if (btn.classList.contains('connected')) return; // already connected — nothing to do
 
-  btn.textContent = 'Waiting for sign-in…';
+  btn.textContent = 'Opened AgentSphere — sign in there';
+  document.getElementById('manualConnectRow').style.display = 'flex';
+  pushBotMsg(`I opened Unicity AgentSphere in a new tab. AgentSphere doesn't message this page back automatically, so once you're signed in there, copy your @handle (and balances, if you want them accurate) into the box below and hit "Confirm" — that links this session to your real wallet without me ever touching your keys.`);
+
   try{
-    // 90s ceiling — if no approval message arrives, fail loudly instead
-    // of leaving the button stuck.
-    const result = await withTimeout(
-      connectViaHostedAgentSphere(),
-      90000,
-      'No approval received from AgentSphere within 90s.'
-    );
+    // 20s: only used to auto-fill the handle if AgentSphere happens to
+    // post a message back. Most of the time nothing arrives — that's
+    // expected, not an error — so we don't show a failure for it.
+    const result = await withTimeout(connectViaHostedAgentSphere(), 20000, 'no auto handoff');
     state.client = null;
     state.identity = result.identity;
     state.address = result.identity?.nametag ? '@' + result.identity.nametag
@@ -575,30 +580,37 @@ async function connectWallet(){
     state.demo = false;
     await fetchRealBalances(result.balances);
     setConnectedUI(state.address);
-    pushBotMsg(`Signed in as ${state.address} via Unicity AgentSphere.`);
+    document.getElementById('manualConnectRow').style.display = 'none';
+    pushBotMsg(`Linked automatically as ${state.address}.`);
   } catch(e){
+    // Silent — no auto handoff is the expected case, not a failure to
+    // surface. The manual row stays visible and the button reverts.
     btn.textContent = 'Connect Unicity AgentSphere Wallet';
-    pushBotMsg(
-      'Could not complete sign-in automatically: ' + (e.message || e) +
-      `. If you approved inside the AgentSphere tab but it didn't link back, type your @nametag below and I'll mark the session connected — balances will need a manual refresh in that case. Otherwise, use "Try demo mode" to explore the interface.`,
-      true
-    );
-    document.getElementById('manualConnectRow').style.display = 'flex';
   }
 }
 
 function manualConfirmConnect(){
   const input = document.getElementById('manualHandleInput');
+  const uctInput = document.getElementById('manualUctInput');
+  const usdcInput = document.getElementById('manualUsdcInput');
   const handle = input.value.trim().replace(/^@/, '');
-  if (!handle) return;
+  if (!handle) { input.focus(); return; }
   state.client = null;
   state.identity = { nametag: handle };
   state.address = '@' + handle;
   state.demo = false;
+  state.balances.UCT = parseFloat(uctInput.value) || 0;
+  state.balances.USDC = parseFloat(usdcInput.value) || 0;
   setConnectedUI(state.address);
   document.getElementById('manualConnectRow').style.display = 'none';
-  pushBotMsg(`Marked as signed in as @${handle}. I couldn't auto-fetch balances for this manual entry, so they show as 0 until a real session links back — use the AgentSphere tab to verify amounts before trading.`, true);
+  const gotBalances = uctInput.value || usdcInput.value;
+  pushBotMsg(
+    gotBalances
+      ? `Connected as @${handle} with the balances you entered from your AgentSphere tab.`
+      : `Connected as @${handle}. No balances were entered, so they show as 0 — paste them from your AgentSphere tab any time using the same connect flow.`
+  );
 }
+
 
 function loadDemoWallet(){
   state.client = null;
@@ -862,7 +874,7 @@ const DOCS = {
     <div class="doc-updated">${DOC_UPDATED}</div>
 
     <div class="faq-q">What wallet does UniTrade connect to?</div>
-    <div class="faq-a">UniTrade only supports Unicity AgentSphere — no other wallet provider is offered. Connecting requires the AgentSphere browser extension to be installed; clicking connect triggers its real sign-in/approval popup. If the extension isn't found, the App tells you immediately rather than waiting indefinitely, and you can use "Try demo mode" to explore the interface with placeholder data instead.</div>
+    <div class="faq-a">UniTrade only supports Unicity AgentSphere — no other wallet provider is offered. Clicking connect opens the AgentSphere wallet at sphere.unicity.network in a new tab. Because AgentSphere doesn't currently message this page back automatically, you confirm the connection by entering your @handle (and, if you'd like accurate balances shown here, your UCT/USDC amounts copied from that tab) into the box that appears next to the connect button. Your keys and funds never leave AgentSphere — this only links the display.</div>
 
     <div class="faq-q">Is UniTrade custodial?</div>
     <div class="faq-a">No. UniTrade never holds your funds or keys. Every swap or bridge is signed and authorized from your own connected wallet.</div>
